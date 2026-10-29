@@ -75,7 +75,7 @@ export const TopFocusKeywords = ({ authAxios, onPick, refreshKey }) => {
         {items.slice(0, 8).map((it, i) => (
           <button
             key={it.job_id}
-            onClick={() => onPick(it.keyword)}
+            onClick={() => onPick(it)}
             data-testid={`focus-row-${i}`}
             className="w-full text-left flex items-center gap-3 px-5 py-3 hover:bg-amber-50/40 transition-colors group"
           >

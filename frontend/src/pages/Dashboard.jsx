@@ -4,7 +4,7 @@ import { Button } from "../components/ui/button";
 import { toast } from "sonner";
 import {
   TrendUp, BookmarkSimple, SignOut, FileCsv, FileText,
-  Clock, ChartLineUp, Tag, Circle, XCircle,
+  Clock, ChartLineUp, Tag, Circle, XCircle, Database,
 } from "@phosphor-icons/react";
 import { ScoreGauge, RatioMeter, MetricTile, VelocityCard } from "../components/ScoreCards";
 import { GigTable } from "../components/GigTable";
@@ -25,14 +25,29 @@ export default function Dashboard() {
   const [keyword, setKeyword] = useState("");
   const [referralOpen, setReferralOpen] = useState(false);
   const [activeJob, setActiveJob] = useState(null);
+  const [activeSnapshot, setActiveSnapshot] = useState(null);
   const [polling, setPolling] = useState(false);
   const [history, setHistory] = useState([]);
   const [watchlist, setWatchlist] = useState([]);
   const [trendData, setTrendData] = useState([]);
 
+  const showFullResult = useCallback((jobDoc) => {
+    setActiveSnapshot(null);
+    setActiveJob(jobDoc);
+    setKeyword(jobDoc.keyword);
+  }, []);
+
+  const showSnapshotOnly = useCallback((detail) => {
+    setActiveJob(null);
+    setTrendData([]);
+    setActiveSnapshot(detail?.market_insight || null);
+    setKeyword(detail?.keyword || detail?.market_insight?.display_keyword || "");
+  }, []);
+
   const refreshHistory = useCallback(async () => {
     const r = await authAxios.get("/scrape/jobs");
     setHistory(r.data);
+    return r.data;
   }, [authAxios]);
 
   const refreshWatchlist = useCallback(async () => {
@@ -52,19 +67,79 @@ export default function Dashboard() {
     } catch {/* noop */}
   }, [authAxios]);
 
+  const loadNicheDetail = useCallback(async (kw) => {
+    const term = (kw || "").trim();
+    if (!term) return;
+    try {
+      const r = await authAxios.get(`/niches/${encodeURIComponent(term)}`);
+      if (r.data.latest_user_job) {
+        showFullResult(r.data.latest_user_job);
+        fetchTrends(r.data.latest_user_job.keyword);
+        return;
+      }
+      showSnapshotOnly(r.data);
+    } catch {
+      toast.error("No stored Mongo result found for that keyword yet.");
+    }
+  }, [authAxios, fetchTrends, showFullResult, showSnapshotOnly]);
+
+  const loadJob = useCallback(async (jobId) => {
+    const r = await authAxios.get(`/scrape/jobs/${jobId}`);
+    showFullResult(r.data);
+    fetchTrends(r.data.keyword);
+  }, [authAxios, fetchTrends, showFullResult]);
+
+  const loadFocusKeyword = useCallback(async (item) => {
+    if (item?.job_id) {
+      loadJob(item.job_id);
+      return;
+    }
+    if (item?.keyword) {
+      loadNicheDetail(item.keyword);
+    }
+  }, [loadJob, loadNicheDetail]);
+
   useEffect(() => { refreshHistory(); refreshWatchlist(); }, [refreshHistory, refreshWatchlist]);
+
+  useEffect(() => {
+    if (activeJob || activeSnapshot || polling) return;
+    const recent = history.find((item) => item.status === "complete");
+    if (recent) loadJob(recent.id);
+  }, [activeJob, activeSnapshot, history, loadJob, polling]);
+
+  const pollJob = async (jobId) => {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((res) => setTimeout(res, 1500));
+      try {
+        const r = await authAxios.get(`/scan/${jobId}`);
+        if (r.data.job_ready) {
+          const job = await authAxios.get(`/scrape/jobs/${r.data.job_id || jobId}`);
+          showFullResult(job.data);
+          setPolling(false);
+          refreshHistory();
+          fetchTrends(job.data.keyword);
+          toast.success(`Scrape complete � Score ${job.data.result?.opportunity_score}`);
+          return;
+        }
+        if (r.data.status === "failed" || r.data.job_status === "failed") {
+          setPolling(false);
+          toast.error("Scrape failed");
+          return;
+        }
+      } catch {/* noop */}
+    }
+    setPolling(false);
+  };
 
   const startSearch = async (kw) => {
     const term = (kw || keyword).trim();
     if (!term) return;
     setKeyword(term);
     setPolling(true);
+    setActiveSnapshot(null);
     try {
-      // Trigger the live pipeline (upserts market_insights)
-      authAxios.post("/scan", { keyword: term }).catch(() => {});
-      // Plus the rich job for the detailed result panes
-      const r = await authAxios.post("/scrape/search", { keyword: term });
-      const jobId = r.data.job_id;
+      const r = await authAxios.post("/scan", { keyword: term });
+      const jobId = r.data.job_id || r.data.task_id;
       setActiveJob({ id: jobId, keyword: term, status: "running", result: null });
       pollJob(jobId);
       refreshBilling();
@@ -79,36 +154,6 @@ export default function Dashboard() {
     }
   };
 
-  const pollJob = async (jobId) => {
-    for (let i = 0; i < 30; i++) {
-      await new Promise((res) => setTimeout(res, 1500));
-      try {
-        const r = await authAxios.get(`/scrape/jobs/${jobId}`);
-        if (r.data.status === "complete") {
-          setActiveJob(r.data);
-          setPolling(false);
-          refreshHistory();
-          fetchTrends(r.data.keyword);
-          toast.success(`Scrape complete · Score ${r.data.result?.opportunity_score}`);
-          return;
-        }
-        if (r.data.status === "failed") {
-          setPolling(false);
-          toast.error("Scrape failed");
-          return;
-        }
-      } catch {/* noop */}
-    }
-    setPolling(false);
-  };
-
-  const loadJob = async (jobId) => {
-    const r = await authAxios.get(`/scrape/jobs/${jobId}`);
-    setActiveJob(r.data);
-    setKeyword(r.data.keyword);
-    fetchTrends(r.data.keyword);
-  };
-
   const exportJob = async (fmt) => {
     if (!activeJob) return;
     const url = `${authAxios.defaults.baseURL}/scrape/jobs/${activeJob.id}/export?format=${fmt}`;
@@ -121,8 +166,9 @@ export default function Dashboard() {
   };
 
   const addWatch = async () => {
-    if (!activeJob) return;
-    await authAxios.post("/watchlist", { keyword: activeJob.keyword });
+    const watchKeyword = activeJob?.keyword || activeSnapshot?.display_keyword || keyword;
+    if (!watchKeyword) return;
+    await authAxios.post("/watchlist", { keyword: watchKeyword });
     toast.success("Added to watchlist");
     refreshWatchlist();
   };
@@ -133,13 +179,15 @@ export default function Dashboard() {
   };
 
   const result = activeJob?.result;
+  const snapshotSignal = activeSnapshot?.snapshot || {};
   const gigs = result?.gigs || [];
   const top10 = gigs.filter((g) => g.position <= 10);
   const bot10 = gigs.filter((g) => g.position > 10);
+  const detailMode = result ? "full_result" : activeSnapshot ? "snapshot_only" : "empty";
+  const activeKeyword = activeJob?.keyword || activeSnapshot?.display_keyword || activeSnapshot?.keyword || keyword;
 
   return (
     <div className="min-h-screen bg-white">
-      {/* Top bar */}
       <header className="border-b border-zinc-200 bg-white sticky top-0 z-20">
         <div className="flex items-center justify-between px-6 lg:px-8 h-14">
           <div className="flex items-center gap-3">
@@ -173,7 +221,6 @@ export default function Dashboard() {
       </header>
 
       <div className="grid lg:grid-cols-[260px_1fr] min-h-[calc(100vh-3.5rem)]">
-        {/* Sidebar */}
         <aside className="border-r border-zinc-200 bg-zinc-50/50 p-4 lg:p-5 space-y-6">
           <div>
             <div className="text-[10px] uppercase tracking-[0.3em] text-zinc-500 font-mono mb-3 flex items-center gap-2">
@@ -187,8 +234,8 @@ export default function Dashboard() {
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-mono truncate">{j.keyword}</span>
                     <span className="text-[9px] font-mono text-zinc-400">
-                      {j.status === "complete" ? `${j.result?.opportunity_score?.toFixed?.(0) ?? "—"}` :
-                       j.status === "running" ? "..." : "✕"}
+                      {j.status === "complete" ? `${j.result?.opportunity_score?.toFixed?.(0) ?? "-"}` :
+                       j.status === "running" ? "..." : "x"}
                     </span>
                   </div>
                 </button>
@@ -205,7 +252,7 @@ export default function Dashboard() {
               {watchlist.map((w) => (
                 <div key={w.id} className="border border-zinc-200 bg-white p-2">
                   <div className="flex items-center justify-between gap-1">
-                    <button onClick={() => startSearch(w.keyword)} className="text-xs font-mono font-bold text-left hover:text-amber-600 truncate flex-1">
+                    <button onClick={() => loadNicheDetail(w.keyword)} className="text-xs font-mono font-bold text-left hover:text-amber-600 truncate flex-1">
                       {w.keyword}
                     </button>
                     <button onClick={() => removeWatch(w.id)} className="text-zinc-400 hover:text-red-500">
@@ -228,15 +275,12 @@ export default function Dashboard() {
           </div>
         </aside>
 
-        {/* Main */}
         <main className="p-6 lg:p-8 space-y-6 max-w-[1600px]">
-          {/* Search */}
           <SearchBar value={keyword} onChange={setKeyword} onSubmit={startSearch} busy={polling} authAxios={authAxios} />
 
-          {/* Live niche board — always visible, polls every 10s while a scan is active */}
-          <LiveNicheBoard activeTaskId={polling ? (activeJob?.id || "pending") : null} onPick={startSearch} />
+          <LiveNicheBoard activeTaskId={polling ? (activeJob?.id || "pending") : null} onPick={loadNicheDetail} />
 
-          {!result && !polling && (
+          {detailMode === "empty" && !polling && (
             <>
               <div className="border border-zinc-200 bg-zinc-50 p-12 text-center">
                 <p className="text-[10px] uppercase tracking-[0.3em] font-mono text-zinc-400 mb-3">Empty terminal</p>
@@ -248,18 +292,80 @@ export default function Dashboard() {
                   broader like <span className="font-bold">"video editing"</span>.
                 </p>
               </div>
-              <TopFocusKeywords authAxios={authAxios} onPick={startSearch} refreshKey={history.length} />
+              <TopFocusKeywords authAxios={authAxios} onPick={loadFocusKeyword} refreshKey={history.length} />
             </>
           )}
 
-          {result && (
+          {detailMode === "snapshot_only" && activeSnapshot && !polling && (
             <>
-              {/* Banner */}
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.3em] font-mono text-zinc-500">Mongo live snapshot</div>
+                  <h1 className="text-3xl lg:text-4xl font-black tracking-tighter" style={{ fontFamily: "'Cabinet Grotesk', system-ui" }} data-testid="active-keyword">
+                    {activeKeyword}
+                  </h1>
+                  <div className="flex items-center gap-3 mt-1 text-[10px] font-mono uppercase tracking-[0.2em]">
+                    <span className="flex items-center gap-1 text-zinc-500">
+                      <Database size={10} weight="bold" /> MARKET SNAPSHOT
+                    </span>
+                    <span className="text-zinc-400">{activeSnapshot.last_scanned ? new Date(activeSnapshot.last_scanned).toLocaleString() : "Awaiting first completed scan"}</span>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <Button onClick={addWatch} data-testid="add-watchlist-btn"
+                    className="rounded-none bg-white hover:bg-zinc-100 text-black border border-zinc-300 font-mono text-xs uppercase tracking-[0.15em] h-9">
+                    <BookmarkSimple size={12} weight="bold" className="mr-1" /> Watch
+                  </Button>
+                  <Button onClick={() => startSearch(activeKeyword)} data-testid="rescan-btn"
+                    className="rounded-none bg-black hover:bg-zinc-800 text-white font-mono text-xs uppercase tracking-[0.15em] h-9">
+                    <TrendUp size={12} weight="bold" className="mr-1" /> Re-scan
+                  </Button>
+                </div>
+              </div>
+
+              <div className="grid lg:grid-cols-3 gap-4">
+                <RatioMeter ratio={snapshotSignal.competition_to_order_ratio || 0} isGold={Boolean(snapshotSignal.ratio_is_gold || activeSnapshot.is_gold)} />
+                <VelocityCard
+                  score={snapshotSignal.velocity_score || 0}
+                  momentumGap={false}
+                  highTicketVacuum={false}
+                />
+                <div className={`border p-5 ${activeSnapshot.is_gold ? "border-amber-500 bg-amber-50" : "border-zinc-200 bg-white"}`} data-testid="snapshot-summary-card">
+                  <div className="text-[10px] uppercase tracking-[0.3em] font-mono text-zinc-500 mb-3">Shared board summary</div>
+                  <div className="flex items-end justify-between gap-4">
+                    <div>
+                      <div className="text-4xl font-black tracking-tighter" style={{ fontFamily: "'Cabinet Grotesk', system-ui" }}>
+                        {(activeSnapshot.score ?? 0).toFixed(0)}
+                      </div>
+                      <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-500">Board score</div>
+                    </div>
+                    {activeSnapshot.is_gold && (
+                      <div className="bg-amber-500 text-white px-2 py-1 text-[10px] font-mono uppercase tracking-[0.2em]">Gold</div>
+                    )}
+                  </div>
+                  <p className="text-xs font-mono text-zinc-600 mt-4 leading-relaxed">
+                    This keyword is loaded from MongoDB market insights. Run a fresh scan to hydrate gig tables, exports, and AI analysis for your account.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-zinc-200">
+                <MetricTile testid="snapshot-total" label="Total Gigs" value={(activeSnapshot.total_gigs ?? 0).toLocaleString()} sublabel={(activeSnapshot.total_gigs ?? 0) < 2000 ? "LOW COMP" : "DENSE"} />
+                <MetricTile testid="snapshot-queue" label="Avg Queue" value={(activeSnapshot.avg_orders_in_queue ?? 0).toFixed(1)} sublabel={`score ${(activeSnapshot.score ?? 0).toFixed(1)}`} />
+                <MetricTile testid="snapshot-opportunity" label="Opportunity" value={snapshotSignal.opportunity_score ?? 0} sublabel={snapshotSignal.data_source === "live" ? "LIVE SCRAPE" : "FALLBACK"} tone={snapshotSignal.data_source === "live" ? "gold" : undefined} />
+                <MetricTile testid="snapshot-saturation" label="Saturation" value={snapshotSignal.saturation_index ?? 0} sublabel={snapshotSignal.ratio_is_gold ? "RATIO GOLD" : "BOARD MODE"} tone={snapshotSignal.ratio_is_gold ? "gold" : undefined} />
+              </div>
+
+              <TopFocusKeywords authAxios={authAxios} onPick={loadFocusKeyword} refreshKey={history.length} />
+            </>
+          )}
+
+          {detailMode === "full_result" && result && (
+            <>
               <div className="flex items-center justify-between flex-wrap gap-3">
                 <div>
                   <div className="text-[10px] uppercase tracking-[0.3em] font-mono text-zinc-500">Current scan</div>
-                  <h1 className="text-3xl lg:text-4xl font-black tracking-tighter" style={{ fontFamily: "'Cabinet Grotesk', system-ui" }}
-                      data-testid="active-keyword">
+                  <h1 className="text-3xl lg:text-4xl font-black tracking-tighter" style={{ fontFamily: "'Cabinet Grotesk', system-ui" }} data-testid="active-keyword">
                     {activeJob.keyword}
                   </h1>
                   <div className="flex items-center gap-3 mt-1 text-[10px] font-mono uppercase tracking-[0.2em]">
@@ -275,6 +381,10 @@ export default function Dashboard() {
                     className="rounded-none bg-white hover:bg-zinc-100 text-black border border-zinc-300 font-mono text-xs uppercase tracking-[0.15em] h-9">
                     <BookmarkSimple size={12} weight="bold" className="mr-1" /> Watch
                   </Button>
+                  <Button onClick={() => startSearch(activeJob.keyword)} data-testid="rescan-btn"
+                    className="rounded-none bg-white hover:bg-zinc-100 text-black border border-zinc-300 font-mono text-xs uppercase tracking-[0.15em] h-9">
+                    <TrendUp size={12} weight="bold" className="mr-1" /> Re-scan
+                  </Button>
                   <Button onClick={() => exportJob("csv")} data-testid="export-csv-btn"
                     className="rounded-none bg-white hover:bg-zinc-100 text-black border border-zinc-300 font-mono text-xs uppercase tracking-[0.15em] h-9">
                     <FileCsv size={12} weight="bold" className="mr-1" /> CSV
@@ -286,7 +396,6 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {/* Score + Ratio + Velocity */}
               <div className="grid lg:grid-cols-3 gap-4">
                 <ScoreGauge score={result.opportunity_score} breakdown={result.breakdown} />
                 <RatioMeter ratio={result.competition_to_order_ratio} isGold={result.ratio_is_gold} />
@@ -294,7 +403,6 @@ export default function Dashboard() {
                   momentumGap={result.momentum_gap} highTicketVacuum={result.high_ticket_vacuum} />
               </div>
 
-              {/* Metrics — 2026 reverse-engineering signals */}
               <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-px bg-zinc-200">
                 <MetricTile testid="metric-total" label="Total Gigs" value={result.metrics.total_services.toLocaleString()} sublabel={result.metrics.total_services < 2000 ? "LOW COMP" : "DENSE"} />
                 <MetricTile testid="metric-queue" label="Avg Queue" value={result.metrics.avg_orders_in_queue} sublabel={`top10 ${result.metrics.avg_queue_top10}`} />
@@ -314,23 +422,19 @@ export default function Dashboard() {
                   sublabel={result.metrics.price_inflation_pct != null ? `${result.metrics.price_inflation_pct >= 0 ? "+" : ""}${result.metrics.price_inflation_pct}% vs prior` : "no prior"}
                   tone={(result.metrics.price_inflation_pct || 0) > 20 ? "gold" : undefined} />
                 <MetricTile testid="metric-ceiling" label="Top Decile" value={`$${result.metrics.top_decile_price}`}
-                  sublabel={result.high_ticket_vacuum ? "HIGH-TICKET VACUUM" : `${result.metrics.high_ticket_count} ≥$200 +queue`}
+                  sublabel={result.high_ticket_vacuum ? "HIGH-TICKET VACUUM" : `${result.metrics.high_ticket_count} >= $200 +queue`}
                   tone={result.high_ticket_vacuum ? "gold" : undefined} />
               </div>
 
-              {/* AI */}
               <AIPanel job={activeJob} authAxios={authAxios} onPickKeyword={startSearch} />
 
-              {/* Top focus keywords across all scans */}
-              <TopFocusKeywords authAxios={authAxios} onPick={startSearch} refreshKey={history.length} />
+              <TopFocusKeywords authAxios={authAxios} onPick={loadFocusKeyword} refreshKey={history.length} />
 
-              {/* Tables */}
               <div className="grid lg:grid-cols-2 gap-4">
-                <GigTable testid="top10-table" title="Top 10 — first page" gigs={top10} />
-                <GigTable testid="bottom10-table" title="Bottom 10 — first page" gigs={bot10} />
+                <GigTable testid="top10-table" title="Top 10 - first page" gigs={top10} />
+                <GigTable testid="bottom10-table" title="Bottom 10 - first page" gigs={bot10} />
               </div>
 
-              {/* Trends */}
               {trendData.length > 1 && (
                 <div className="border border-zinc-200 bg-white p-5" data-testid="trend-chart">
                   <div className="flex items-center justify-between mb-4">
@@ -352,7 +456,6 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {/* Tags */}
               {result.tags?.length > 0 && (
                 <div className="border border-zinc-200 bg-white p-5" data-testid="tag-cloud">
                   <div className="text-[10px] uppercase tracking-[0.3em] font-mono text-zinc-500 mb-3 flex items-center gap-2">

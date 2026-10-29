@@ -9,6 +9,7 @@ scan_tasks collection:
     started_at, completed_at, error }
 """
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from auth import get_current_user
 from scraper import deep_scrape
-from billing import is_pro, assert_can_scan
+from billing import assert_can_scan
 
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', '').lower().strip()
 
@@ -47,6 +48,16 @@ def compute_live_score(avg_orders: float, total_gigs: int) -> float:
 
 
 def make_live_routes(users_col, jobs_col, market_col, tasks_col, referral_col):
+    async def latest_complete_job(keyword: str, user_id: str):
+        return await jobs_col.find_one(
+            {
+                "user_id": user_id,
+                "keyword": {"$regex": f"^{re.escape(keyword)}$", "$options": "i"},
+                "status": "complete",
+            },
+            {"_id": 0},
+            sort=[("created_at", -1)],
+        )
 
     # --------- DEEP SCAN WORKER ---------
     async def run_deep_scan(task_id: str, keyword: str, user_id: str):
@@ -87,16 +98,25 @@ def make_live_routes(users_col, jobs_col, market_col, tasks_col, referral_col):
                 }, "$inc": {"scan_count": 1}},
                 upsert=True,
             )
+            await jobs_col.update_one(
+                {"id": task_id, "user_id": user_id},
+                {"$set": {"status": "complete", "completed_at": now, "result": result}},
+            )
             await tasks_col.update_one(
                 {"task_id": task_id},
                 {"$set": {"status": "complete", "completed_at": now,
-                          "score": score, "is_gold": gold, "phase": "done"}},
+                          "score": score, "is_gold": gold, "phase": "done", "job_ready": True}},
             )
         except Exception as e:
+            now = datetime.now(timezone.utc).isoformat()
+            await jobs_col.update_one(
+                {"id": task_id, "user_id": user_id},
+                {"$set": {"status": "failed", "error": str(e)[:200], "completed_at": now}},
+            )
             await tasks_col.update_one(
                 {"task_id": task_id},
                 {"$set": {"status": "failed", "error": str(e)[:200],
-                          "completed_at": datetime.now(timezone.utc).isoformat()}},
+                          "completed_at": now, "job_ready": False}},
             )
 
     # --------- SCAN TRIGGER ---------
@@ -132,15 +152,22 @@ def make_live_routes(users_col, jobs_col, market_col, tasks_col, referral_col):
             "status": "running",
             "created_at": now,
             "via": "live_pipeline",
+            "result": None,
         })
         bg.add_task(run_deep_scan, task_id, keyword, user["id"])
-        return {"task_id": task_id, "status": "queued", "keyword": keyword}
+        return {"task_id": task_id, "job_id": task_id, "status": "queued", "keyword": keyword}
 
     @niches_router.get("/scan/{task_id}")
     async def get_scan_task(task_id: str, user=Depends(get_current_user)):
         doc = await tasks_col.find_one({"task_id": task_id, "user_id": user["id"]}, {"_id": 0})
         if not doc:
             raise HTTPException(404, "Task not found")
+        job = await jobs_col.find_one({"id": task_id, "user_id": user["id"]}, {"_id": 0})
+        doc["job_id"] = task_id
+        doc["job_status"] = job.get("status") if job else None
+        doc["job_ready"] = bool(job and job.get("status") == "complete" and job.get("result"))
+        if doc["job_ready"]:
+            doc["result"] = job["result"]
         return doc
 
     # --------- LIVE NICHES BOARD ---------
@@ -151,6 +178,20 @@ def make_live_routes(users_col, jobs_col, market_col, tasks_col, referral_col):
             ("score", -1), ("last_scanned", -1),
         ]).limit(limit).to_list(limit)
         return {"count": len(docs), "items": docs}
+
+    @niches_router.get("/niches/{keyword}")
+    async def get_niche_detail(keyword: str, user=Depends(get_current_user)):
+        market_doc = await market_col.find_one({"keyword": keyword.lower()}, {"_id": 0})
+        user_job = await latest_complete_job(keyword, user["id"])
+        if not market_doc and not user_job:
+            raise HTTPException(404, "Niche not found")
+        return {
+            "keyword": keyword,
+            "market_insight": market_doc,
+            "latest_user_job": user_job,
+            "detail_source": "user_job" if user_job else "market_snapshot",
+            "can_rescan": True,
+        }
 
     # --------- REFERRALS ---------
     def _generate_code(email: str) -> str:
